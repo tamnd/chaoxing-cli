@@ -3,171 +3,154 @@ package chaoxing
 import (
 	"context"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes chaoxing as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/chaoxing-cli/chaoxing"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// chaoxing:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone cx binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the chaoxing driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the Chaoxing kit driver.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity for the chaoxing driver.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "chaoxing",
-		Hosts:  []string{Host},
+		Hosts:  []string{Host, "mooc1.chaoxing.com", "xuexi.chaoxing.com"},
 		Identity: kit.Identity{
 			Binary: "cx",
 			Short:  "Browse Chaoxing university courses",
-			Long: `Browse Chaoxing university courses
+			Long: `cx reads public Chaoxing (超星) course data over HTTPS.
 
-cx reads public chaoxing data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+The public course catalog is accessible without login. Individual courses
+behind authentication return exit 5.
+
+Quick start:
+  cx search python              search courses about Python
+  cx course 123456              course details by ID`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/chaoxing-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and the two operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `cx page` and
-	// `ant get chaoxing://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "courses",
+		Summary: "Search public Chaoxing courses",
+		Args:    []kit.Arg{{Name: "keyword", Help: "search keyword"}},
+	}, searchOp)
 
-	// List op: members of a page, the home of `cx links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// chaoxing://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:     "course",
+		Group:    "courses",
+		Single:   true,
+		Resolver: true,
+		URIType:  "course",
+		Summary:  "Fetch course details by ID",
+		Args:     []kit.Arg{{Name: "id", Help: "Chaoxing course ID"}},
+	}, courseOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := NewClient(DefaultConfig())
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		c.cfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		c.cfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		c.cfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.cfg.Timeout = cfg.Timeout
+		c.http.Timeout = cfg.Timeout
 	}
 	return c, nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Keyword string  `kit:"arg" help:"search keyword"`
+	Limit   int     `kit:"flag,inherit" help:"max results"`
+	Page    int     `kit:"flag" name:"page" help:"result page number"`
+	Client  *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
+type courseInput struct {
+	ID     string  `kit:"arg" help:"Chaoxing course ID"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchOp(ctx context.Context, in searchInput, emit func(*CourseResult) error) error {
+	results, err := in.Client.Search(ctx, in.Keyword, SearchOptions{
+		Limit: in.Limit,
+		Page:  in.Page,
+	})
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range results {
+		if err := emit(&results[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+func courseOp(ctx context.Context, in courseInput, emit func(*Course) error) error {
+	c, err := in.Client.GetCourse(ctx, in.ID)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(c)
+}
 
-// Classify turns any accepted input — a bare path or a full chaoxing.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+// --- Resolver ---
+
+// Classify turns a Chaoxing course URL or bare numeric ID into (type, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized chaoxing reference: %q", input)
-	}
-	return "page", id, nil
-}
-
-// Locate is the inverse: the live https URL for a (type, id).
-func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("chaoxing has no resource type %q", uriType)
-	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
 	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+	if u, err2 := url.Parse(input); err2 == nil &&
+		(u.Scheme == "http" || u.Scheme == "https") &&
+		strings.Contains(u.Host, "chaoxing.com") {
+		if cid := u.Query().Get("courseId"); cid != "" {
+			return "course", cid, nil
+		}
 	}
-	return strings.Trim(input, "/")
+	if _, err2 := strconv.Atoi(input); err2 == nil && input != "" {
+		return "course", input, nil
+	}
+	return "", "", errs.Usage("unrecognized Chaoxing reference: %q", input)
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// Locate returns the canonical URL for (type, id).
+func (Domain) Locate(uriType, id string) (string, error) {
+	switch uriType {
+	case "course":
+		return BaseURL + "/mooc-ans/open-course/detail?courseId=" + id, nil
+	}
+	return "", errs.Usage("chaoxing has no resource type %q", uriType)
+}
+
+// mapErr converts library errors to kit error kinds.
 func mapErr(err error) error {
+	switch {
+	case err == ErrBlocked:
+		return errs.RateLimited("%s", err.Error())
+	case err == ErrNotFound:
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
 }
