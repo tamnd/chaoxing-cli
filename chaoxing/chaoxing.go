@@ -1,62 +1,94 @@
 // Package chaoxing is the library behind the cx command line:
-// the HTTP client, request shaping, and the typed data models for chaoxing.
+// the HTTP client, pacing, auth-detection, and typed data models for
+// Chaoxing (超星学习通), China's largest university e-learning platform.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The public course search API at mooc1.chaoxing.com is accessible without
+// login. Auth-gated endpoints redirect to passport.chaoxing.com; the client
+// detects that and returns ErrBlocked, mapped to exit code 5 by the CLI.
 package chaoxing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to chaoxing. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "cx/dev (+https://github.com/tamnd/chaoxing-cli)"
+// DefaultUserAgent mimics a browser to avoid trivial bot filters.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at chaoxing.com; change it once you
-// know the real endpoints you want to read.
+// Host is the primary Chaoxing hostname.
 const Host = "chaoxing.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the MOOC endpoint root.
+const BaseURL = "https://mooc1.chaoxing.com"
 
-// Client talks to chaoxing over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// ErrBlocked is returned when auth is required or the site blocks the client.
+// The CLI maps this to exit code 5 (KindRateLimited).
+var ErrBlocked = errors.New("blocked: authentication required (exit 5)")
+
+// ErrNotFound is returned when a course does not exist.
+var ErrNotFound = errors.New("course not found")
+
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Retries   int
+	Timeout   time.Duration
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns sensible defaults for mooc1.chaoxing.com.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Retries:   3,
+		Timeout:   30 * time.Second,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is a rate-limited HTTP client for the Chaoxing public API.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured with cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg: cfg,
+		http: &http.Client{
+			Timeout: cfg.Timeout,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// Intercept login redirects so we can detect them.
+				loc := req.URL.String()
+				if strings.Contains(loc, "passport.chaoxing.com") ||
+					(strings.Contains(loc, "login") && strings.Contains(loc, "chaoxing")) {
+					return http.ErrUseLastResponse
+				}
+				return nil
+			},
+		},
+	}
+}
+
+// Get fetches rawURL and returns the body. Paces, retries, detects blocks.
+func (c *Client) Get(ctx context.Context, rawURL string) ([]byte, error) {
+	return c.do(ctx, rawURL)
+}
+
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,55 +96,76 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
+		c.pace()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		if err != nil {
 			return nil, err
 		}
+		req.Header.Set("User-Agent", c.cfg.UserAgent)
+		req.Header.Set("Accept", "application/json,text/html;q=0.9,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+		req.Header.Set("Referer", BaseURL+"/")
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, rerr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		if isBlocked(resp, body) {
+			return nil, ErrBlocked
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("http %d", resp.StatusCode)
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, ErrNotFound
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("http %d", resp.StatusCode)
+		}
+		return body, nil
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("after %d attempts: %w", c.cfg.Retries, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, false, err
-	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
-	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
-}
-
-// pace blocks until at least Rate has passed since the previous request.
+// pace blocks until at least Rate has elapsed since the last request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
+}
+
+// isBlocked detects login redirects and auth errors from Chaoxing.
+func isBlocked(resp *http.Response, body []byte) bool {
+	if resp.StatusCode == http.StatusForbidden {
+		return true
+	}
+	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusMovedPermanently {
+		loc := resp.Header.Get("Location")
+		if strings.Contains(loc, "passport.chaoxing.com") ||
+			(strings.Contains(loc, "login") && strings.Contains(loc, "chaoxing")) {
+			return true
+		}
+	}
+	s := string(body)
+	if strings.Contains(s, `"result":false`) &&
+		(strings.Contains(s, "未登录") || strings.Contains(s, "请登录") || strings.Contains(s, "登录")) {
+		return true
+	}
+	return false
 }
 
 func backoff(attempt int) time.Duration {
@@ -121,80 +174,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on chaoxing.com. It is a stand-in for the typed records you
-// will model from the real chaoxing endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `cx cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
